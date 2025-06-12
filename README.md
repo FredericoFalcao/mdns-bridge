@@ -22,8 +22,11 @@ npm install mdns-server express axios
 ```
 
 ### 2. Run as a Client (default)
+Provide the sync server URL via `--server-url` or the `SERVER_URL` environment variable.
 ```bash
-node mdns-sync.js
+SERVER_URL=http://my-server:3000/sync node mdns-sync.js
+# or
+node mdns-sync.js --server-url http://my-server:3000/sync
 ```
 
 ### 3. Run as a Server

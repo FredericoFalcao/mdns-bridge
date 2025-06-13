@@ -2,116 +2,72 @@
 // A single-file mDNS sync tool acting as client or server
 // Uses mdns-server for mDNS and Express for HTTP
 
-const express = require('express');
-const axios = require('axios');
-const mdns = require('mdns-server');
+const fs = require("fs");
+//  0. HELPER FUNCTIONS
+function convertBufferToString(a) {if (a.data) for (i in a.data) a.data[i] = a.data[i].toString(); return a;}
 
-const TTL_MS = 10 * 60 * 1000; // 10 minutes
-const SYNC_INTERVAL = 60 * 1000; // 60 seconds
+const db = {};
 
-// Parse command line arguments for --server-url
-function getArg(name) {
-  const idx = process.argv.indexOf(name);
-  if (idx !== -1 && process.argv[idx + 1]) return process.argv[idx + 1];
-  const pref = name + '=';
-  const arg = process.argv.find((a) => a.startsWith(pref));
-  return arg ? arg.slice(pref.length) : null;
+
+function sniffmDNSpackets(NetworkInterfaceIpAddr) {
+	const mdns = require('mdns-server')({interface: NetworkInterfaceIpAddr,reuseAddr: true,loopback: false,noInit: true});
+
+	// listen for response events from server
+	mdns.on('response', function(response) {
+	  console.log("got a new mDNS response.",response);
+	  for (k in response.answers) {
+		  let answer = response.answers[k];
+		  
+		  // 1. Handle DEVICES for a given SERVICE
+		  if (answer.type == "PTR") {
+			  // 1.1 Filter by RELEVANT SERVICE TYPES
+			  if (!["in-addr.arpa","_googlecast._tcp.local","_tcp.local"].some(suffix => answer.name.endsWith(suffix))) return;
+			  
+			  // 1.2 Initialize POINTERS (services) sub-database
+			  if (!db.PTR) db.PTR = {};
+  
+			  // 1.3 Initialize this SERVICE TYPE (e.g. _googlecast._tcp.local), if needed
+			  if (!db.PTR[answer.name]) {
+			  	  db.PTR[answer.name] = [answer.data];
+			  }	else {
+				  // Add a new DEVICE to this SERVICE TYPE if needed
+				  if (!db.PTR[answer.name].includes(answer.data)) 
+					  db.PTR[answer.name].push(answer.data);
+			  }		  	
+		  }
+		  // 2. Handle DEVICE IP resolution
+		  if (answer.type == "A") {
+			  // 2.1 Initialize ADDRESSES sub-database
+			  if (!db.A) db.A = {};
+			  db.A[answer.name] = answer.data;		  	
+		  }
+		  
+		  if (["TXT","SRV"].includes(answer.type)) {
+			  // Initialize this device / entry, if needed
+			  if (db[answer.name] === undefined) db[answer.name] = {"TXT":null,"SRV":null};
+			  
+			  db[answer.name][answer.type] = answer.data;
+		  }
+		  
+		  fs.writeFileSync('database.json', JSON.stringify(db));
+	  }
+	})
+
+	// listen for query events from server
+	mdns.on('query', function(query) {/*	var q = []; if (query.questions) q = q.concat(query.questions); */});
+
+	// listen for the server being destroyed
+	mdns.on('destroyed', function () {console.log('Server destroyed.');process.exit(0);});
+
+	// query for all services on networks
+	mdns.on('ready', function () {
+		
+	  console.log("mDNS server is ready...");
+	  // mdns.query({questions:[{ name: '_:googlecast._tcp.local', type: 'PTR', class: 'IN'}]} );
+	})
+
+	// initialize the server now that we are watching for events
+	mdns.initServer()
+
 }
-
-const SERVER_URL = getArg('--server-url') || process.env.SERVER_URL;
-
-// In-memory database of services
-const services = {}; // key -> {record, ts}
-
-// Helper: unique key for de-duplication
-function keyFor(rec) {
-  return `${rec.name}:${rec.type}`;
-}
-
-function addOrUpdate(rec) {
-  services[keyFor(rec)] = { record: rec, ts: Date.now() };
-}
-
-function purgeOld() {
-  const now = Date.now();
-  for (const k of Object.keys(services)) {
-    if (now - services[k].ts > TTL_MS) {
-      delete services[k];
-    }
-  }
-}
-
-// Filtering placeholder
-function filterFn(rec) {
-  // Example: return rec.name.endsWith('_http._tcp.local');
-  return true; // capture everything by default
-}
-
-function startMdnsCapture() {
-  const server = mdns();
-
-  server.on('response', (res) => {
-    for (const answer of res.answers) {
-      if (filterFn(answer)) addOrUpdate(answer);
-    }
-  });
-
-  // also listen to queries if desired
-  server.on('query', (q) => {
-    for (const question of q.questions) {
-      if (filterFn(question)) addOrUpdate(question);
-    }
-  });
-
-  // start server
-  server.createMDNS();
-  return server;
-}
-
-async function syncWithServer(mdnsServer) {
-  purgeOld();
-  try {
-    const localEntries = Object.values(services).map((s) => s.record);
-    const res = await axios.post(SERVER_URL, { entries: localEntries });
-    const remoteEntries = res.data.entries || [];
-    remoteEntries.forEach((entry) => {
-      addOrUpdate(entry);
-      mdnsServer.respond(entry); // inject into local subnet
-    });
-  } catch (err) {
-    console.error('Sync error', err.message);
-  }
-}
-
-function startClient() {
-  if (!SERVER_URL) {
-    console.error('SERVER_URL must be provided via --server-url or environment variable');
-    process.exit(1);
-  }
-  const mdnsServer = startMdnsCapture();
-  setInterval(() => syncWithServer(mdnsServer), SYNC_INTERVAL);
-  setInterval(purgeOld, TTL_MS);
-}
-
-function startServer() {
-  const app = express();
-  app.use(express.json());
-
-  app.post('/sync', (req, res) => {
-    const entries = req.body.entries || [];
-    entries.forEach((e) => addOrUpdate(e));
-    purgeOld();
-    res.json({ entries: Object.values(services).map((s) => s.record) });
-  });
-
-  const port = process.env.PORT || 3000;
-  app.listen(port, () => console.log(`Server listening on ${port}`));
-
-  setInterval(purgeOld, TTL_MS);
-}
-
-if (process.argv.includes('--server')) {
-  startServer();
-} else {
-  startClient();
-}
+sniffmDNSpackets("192.168.1.84");
